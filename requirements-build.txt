@@ -1,2 +1,3 @@
 # Keep this pinned for reproducible cross-platform vendoring.
 keyring==25.6.0
+backports.tarfile==1.2.0

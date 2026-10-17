@@ -34,7 +34,7 @@ jobs:
         with:
           # Match the Python generation used by current Anki releases, and use
           # the same version on all three runners for consistent dependency resolution.
-          python-version: '3.13'
+          python-version: '3.11'
 
       - name: Install pinned dependencies into platform vendor directory
         shell: bash
