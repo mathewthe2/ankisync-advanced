@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from aqt import gui_hooks, mw
+import aqt.main as _aqt_main
 from aqt.qt import (
     QCheckBox,
     QDialog,
@@ -26,7 +27,7 @@ from aqt.qt import (
     QVBoxLayout,
     Qt,
 )
-from aqt.utils import qconnect, showInfo, showWarning
+from aqt.utils import qconnect, showWarning
 
 # The release ZIP vendors keyring dependencies separately for each OS. Select the
 # matching bundle before importing keyring so users do not need to pip-install it.
@@ -164,7 +165,6 @@ def _login_selected_endpoint(endpoint: dict, parent=None) -> bool:
         mw.pm.set_sync_key(auth.hkey)
         mw.pm.set_sync_username(username)
         mw.pm.save()
-        showInfo(f"Logged in to {endpoint.get('name', 'selected endpoint')} as {username}.", parent=parent)
         return True
     except Exception as exc:
         showWarning(f"Login failed: {exc}", parent=parent)
@@ -182,6 +182,21 @@ def _apply_selected_endpoint(config: dict) -> bool:
     # mw.pm.custom_sync_url() / mw.pm.set_custom_sync_url(...).
     mw.pm.set_custom_sync_url(url)
     mw.pm.save()
+    return True
+
+
+def _activate_selected_endpoint(config: dict, parent=None) -> bool:
+    """Apply the selected URL and immediately authenticate with its saved credentials."""
+    endpoint = _selected_endpoint(config)
+    if not endpoint:
+        return False
+    if not _apply_selected_endpoint(config):
+        showWarning("Could not apply the selected endpoint URL.", parent=parent)
+        return False
+    if endpoint.get("override_credentials"):
+        # Anki stores one sync authentication key per Anki profile. Authenticate
+        # whenever an endpoint becomes active, rather than requiring a separate button.
+        return _login_selected_endpoint(endpoint, parent=parent)
     return True
 
 
@@ -334,11 +349,9 @@ class AnkiSyncAdvancedDialog(QDialog):
         self.add_button = QPushButton("Add…")
         self.edit_button = QPushButton("Edit…")
         self.remove_button = QPushButton("Remove")
-        self.login_button = QPushButton("Log in with endpoint credentials")
         buttons_row.addWidget(self.add_button)
         buttons_row.addWidget(self.edit_button)
         buttons_row.addWidget(self.remove_button)
-        buttons_row.addWidget(self.login_button)
         buttons_row.addStretch(1)
         root.addLayout(buttons_row)
 
@@ -356,7 +369,6 @@ class AnkiSyncAdvancedDialog(QDialog):
         qconnect(self.add_button.clicked, self._add_endpoint)
         qconnect(self.edit_button.clicked, self._edit_endpoint)
         qconnect(self.remove_button.clicked, self._remove_endpoint)
-        qconnect(self.login_button.clicked, self._login_endpoint)
         self._refresh_list()
 
     def _close_clicked(self, _button=None):
@@ -388,7 +400,6 @@ class AnkiSyncAdvancedDialog(QDialog):
         has_selection = row >= 0 and row < len(self.config.get("endpoints", []))
         self.edit_button.setEnabled(has_selection)
         self.remove_button.setEnabled(has_selection)
-        self.login_button.setEnabled(has_selection)
         if not has_selection:
             return
         item = self.endpoint_list.item(row)
@@ -397,8 +408,7 @@ class AnkiSyncAdvancedDialog(QDialog):
             self.config["selected_endpoint_id"] = endpoint_id
             _save(self.config)
             if self.config.get("enabled"):
-                if not _apply_selected_endpoint(self.config):
-                    showWarning("Could not apply the selected endpoint URL.", parent=self)
+                _activate_selected_endpoint(self.config, parent=self)
                 self._refresh_list(endpoint_id)
 
     def _enabled_toggled(self, enabled: bool):
@@ -408,6 +418,9 @@ class AnkiSyncAdvancedDialog(QDialog):
                 self.enabled_checkbox.setChecked(False)
                 self.enabled_checkbox.blockSignals(False)
                 return
+            endpoint = _selected_endpoint(self.config)
+            if endpoint and endpoint.get("override_credentials"):
+                _login_selected_endpoint(endpoint, parent=self)
         else:
             _disable(self.config)
         self._refresh_list()
@@ -428,7 +441,7 @@ class AnkiSyncAdvancedDialog(QDialog):
         self.config["selected_endpoint_id"] = endpoint["id"]
         _save(self.config)
         if self.config.get("enabled"):
-            _apply_selected_endpoint(self.config)
+            _activate_selected_endpoint(self.config, parent=self)
         self._refresh_list(endpoint["id"])
 
     def _edit_endpoint(self):
@@ -463,7 +476,7 @@ class AnkiSyncAdvancedDialog(QDialog):
                 return
         _save(self.config)
         if self.config.get("enabled") and endpoint.get("id") == self.config.get("selected_endpoint_id"):
-            _apply_selected_endpoint(self.config)
+            _activate_selected_endpoint(self.config, parent=self)
         self._refresh_list(endpoint["id"])
 
     def _remove_endpoint(self):
@@ -496,15 +509,6 @@ class AnkiSyncAdvancedDialog(QDialog):
                 self.enabled_checkbox.blockSignals(False)
         self._refresh_list()
 
-    def _login_endpoint(self):
-        endpoint = self._current_endpoint()
-        if not endpoint:
-            return
-        if not _valid_url(endpoint.get("url", "")):
-            showWarning("The selected endpoint URL is invalid.", parent=self)
-            return
-        _login_selected_endpoint(endpoint, parent=self)
-
     def _current_endpoint(self) -> dict | None:
         row = self.endpoint_list.currentRow()
         endpoints = self.config.get("endpoints", [])
@@ -514,6 +518,83 @@ class AnkiSyncAdvancedDialog(QDialog):
         endpoint_id = item.data(Qt.ItemDataRole.UserRole)
         return next((e for e in endpoints if e.get("id") == endpoint_id), None)
 
+
+
+# Anki 25.09 calls aqt.main.sync_login() when the sync authentication key is
+# missing (for example, after the user logs out from the main menu). Intercept
+# that entry point so an enabled endpoint with credential override can log in
+# automatically instead of displaying Anki's "Account Required" dialog.
+_ORIGINAL_ANKI_SYNC_LOGIN = _aqt_main.sync_login
+
+
+def _sync_login_using_active_endpoint(
+    target_mw, on_success, username: str = "", password: str = ""
+) -> None:
+    config = _config()
+    endpoint = _selected_endpoint(config)
+
+    # Preserve Anki's normal login behavior unless this add-on's selected
+    # endpoint is active and explicitly configured to override credentials.
+    if (
+        target_mw is not mw
+        or not config.get("enabled")
+        or endpoint is None
+        or not endpoint.get("override_credentials")
+    ):
+        return _ORIGINAL_ANKI_SYNC_LOGIN(
+            target_mw, on_success, username, password
+        )
+
+    if not _apply_selected_endpoint(config):
+        showWarning(
+            "AnkiSync Advanced could not apply the active endpoint URL.",
+            parent=target_mw,
+        )
+        return
+
+    endpoint_username = (endpoint.get("username") or "").strip()
+    endpoint_password = _get_password(endpoint)
+    if not endpoint_username or endpoint_password is None:
+        showWarning(
+            "The active AnkiSync Advanced endpoint has credential override enabled, "
+            "but its username or saved password is missing. Edit the endpoint and "
+            "save its credentials before syncing.",
+            parent=target_mw,
+        )
+        return
+
+    def on_login_done(future) -> None:
+        try:
+            auth = future.result()
+        except Exception as exc:
+            showWarning(
+                "Could not authenticate with the active AnkiSync Advanced endpoint "
+                f"'{endpoint.get('name', 'Unnamed')}'\n\n{exc}",
+                parent=target_mw,
+            )
+            return
+
+        target_mw.pm.set_sync_key(auth.hkey)
+        target_mw.pm.set_sync_username(endpoint_username)
+        target_mw.pm.save()
+        on_success()
+
+    # Use Anki's standard background task manager for network authentication.
+    # Once the hkey is stored, resume Anki's original sync flow.
+    target_mw.taskman.with_progress(
+        lambda: target_mw.col.sync_login(
+            username=endpoint_username,
+            password=endpoint_password,
+            endpoint=target_mw.pm.sync_endpoint(),
+        ),
+        on_login_done,
+        parent=target_mw,
+    )
+
+
+# The built-in sync handler resolves this module-level symbol when clicked.
+# This leaves Anki's normal sync flow unchanged for non-overridden endpoints.
+_aqt_main.sync_login = _sync_login_using_active_endpoint
 
 def show_dialog():
     # Keep a reference so the dialog is not garbage-collected while open.
